@@ -10,6 +10,7 @@ function App() {
   const [deviceStatus, setDeviceStatus] = useState("Detecting audio...");
   const [context, setContext] = useState("");
   const [activeTab, setActiveTab] = useState("live");
+  const [modelSize, setModelSize] = useState("small");
   const [expandedSection, setExpandedSection] = useState(null); // 'transcription', 'analysis', or null
 
   const ws = useRef(null);
@@ -22,6 +23,15 @@ function App() {
       if (ws.current) ws.current.close();
     };
   }, []);
+
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        ws.current.send(JSON.stringify({ type: "update_config", model: modelSize }));
+      }
+    }, 500);
+    return () => clearTimeout(handler);
+  }, [modelSize, status]);
 
   // Send context update when it changes (debounced)
   useEffect(() => {
@@ -169,6 +179,22 @@ function App() {
       <div className="main-content">
         {activeTab === 'context' ? (
           <div className="context-container">
+            <div className="input-group" style={{ flex: '0 0 auto', marginBottom: '20px' }}>
+              <label>Whisper Model Size</label>
+              <select
+                className="context-input"
+                value={modelSize}
+                onChange={(e) => setModelSize(e.target.value)}
+                style={{ padding: '12px', cursor: 'pointer' }}
+              >
+                <option value="tiny">Tiny (Fastest, Low Accuracy)</option>
+                <option value="base">Base (Balanced)</option>
+                <option value="small">Small (Good Accuracy)</option>
+                <option value="medium">Medium (Better, Slower)</option>
+                <option value="large-v3">Large v3 (Best, Slowest)</option>
+              </select>
+            </div>
+
             <div className="input-group">
               <label>System Context / Instructions</label>
               <textarea

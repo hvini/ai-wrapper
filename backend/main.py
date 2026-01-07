@@ -16,7 +16,7 @@ logger = logging.getLogger("Backend")
 
 # Configuration
 OLLAMA_URL = "http://localhost:11434/api/generate"
-WHISPER_MODEL_SIZE = "small"
+WHISPER_MODEL_SIZE = "large"
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4096
 
@@ -124,24 +124,45 @@ class AudioRecorder:
 
 class TranscriptionService:
     def __init__(self):
-        logger.info(f"Loading Whisper model ({WHISPER_MODEL_SIZE})...")
+        self.current_model_size = WHISPER_MODEL_SIZE
+        self.load_model(self.current_model_size)
+
+    def load_model(self, size):
+        logger.info(f"Loading Whisper model ({size})...")
         try:
             # Try GPU first
-            self.model = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-            logger.info("Whisper model loaded on GPU (CUDA)")
+            self.model = WhisperModel(size, device="cuda", compute_type="float16")
+            logger.info(f"Whisper model ({size}) loaded on GPU (CUDA)")
+            self.current_model_size = size
+            return True
         except Exception as e:
             logger.warning(f"Failed to load on GPU ({e}). Falling back to CPU...")
-            self.model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-            logger.info("Whisper model loaded on CPU")
+            try:
+                self.model = WhisperModel(size, device="cpu", compute_type="int8")
+                logger.info(f"Whisper model ({size}) loaded on CPU")
+                self.current_model_size = size
+                return True
+            except Exception as e2:
+                logger.error(f"Failed to load model on CPU: {e2}")
+                return False
 
     def transcribe(self, audio_data):
         try:
             # VAD filter provided by faster-whisper
             # We can also check if signal is silence manually to save compute
-            if np.max(np.abs(audio_data)) < 0.01:
+            if np.max(np.abs(audio_data)) < 0.002:
                 return ""
 
-            segments, info = self.model.transcribe(audio_data, beam_size=5, vad_filter=True, language="pt")
+            segments, info = self.model.transcribe(
+                audio_data, 
+                beam_size=1,            # Faster (Greedy)
+                best_of=1,              # Faster
+                vad_filter=True, 
+                vad_parameters=dict(min_silence_duration_ms=500), # More aggressive VAD
+                language="pt",
+                temperature=0.0,
+                condition_on_previous_text=False # vital for short independent chunks
+            )
             text = " ".join([segment.text for segment in segments]).strip()
             return text
         except Exception as e:
@@ -189,12 +210,13 @@ ollama = OllamaService()
 async def ws_handler(websocket):
     logger.info("Client connected")
     global transcriber
+    session_transcript = []
     if transcriber is None:
         transcriber = TranscriptionService()
 
     async def process_audio_loop():
         buffer = np.array([], dtype=np.float32)
-        PROCESS_INTERVAL = 5.0 
+        PROCESS_INTERVAL = 3.0 
         
         while True:
             if not recorder.running:
@@ -211,7 +233,14 @@ async def ws_handler(websocket):
                 if len(buffer) >= SAMPLE_RATE * PROCESS_INTERVAL:
                     logger.info(f"Buffer full ({len(buffer)} samples), transcribing...")
                     current_buffer = buffer.copy()
-                    buffer = np.array([], dtype=np.float32)
+                    
+                    # Implement simple overlap to catch words at boundary
+                    # Keep last 0.5s of audio for context in next chunk
+                    overlap_samples = int(SAMPLE_RATE * 0.5)
+                    if len(buffer) > overlap_samples:
+                         buffer = buffer[-overlap_samples:]
+                    else:
+                         buffer = np.array([], dtype=np.float32)
                     
                     loop = asyncio.get_running_loop()
                     text = await loop.run_in_executor(None, transcriber.transcribe, current_buffer)
@@ -222,20 +251,7 @@ async def ws_handler(websocket):
                             "type": "transcription",
                             "text": text
                         }))
-                        
-                        # Run analysis in background so we don't block transcription
-                        async def analyze_task(t):
-                            analysis = await loop.run_in_executor(None, ollama.process, t)
-                            if analysis:
-                                try:
-                                    await websocket.send(json.dumps({
-                                        "type": "ollama_response",
-                                        "text": analysis
-                                    }))
-                                except Exception as e:
-                                    logger.error(f"Error sending analysis: {e}")
-
-                        asyncio.create_task(analyze_task(text))
+                        session_transcript.append(text)
                     else:
                         logger.info("Transcription yielded empty text (silence?)")
             else:
@@ -257,6 +273,7 @@ async def ws_handler(websocket):
                 }))
                 
             elif msg_type == "start_record":
+                session_transcript.clear()
                 device_idx = data.get("device_index")
                 logger.info(f"Request start record with device_index: {device_idx} (Type: {type(device_idx)})")
                 recorder.set_device(device_idx)
@@ -268,11 +285,37 @@ async def ws_handler(websocket):
             elif msg_type == "stop_record":
                 recorder.stop()
                 await websocket.send(json.dumps({"type": "status", "message": "Recording stopped"}))
+
+                full_text = " ".join(session_transcript).strip()
+                if full_text:
+                    logger.info("Analyzing full transcript...")
+                    await websocket.send(json.dumps({"type": "status", "message": "Generating AI Insights..."}))
+                    loop = asyncio.get_running_loop()
+                    analysis = await loop.run_in_executor(None, ollama.process, full_text)
+                    if analysis:
+                        await websocket.send(json.dumps({
+                            "type": "ollama_response",
+                            "text": analysis
+                        }))
             
             elif msg_type == "update_context":
                 ctx = data.get("context", "")
                 ollama.set_context(ctx)
                 logger.info(f"Updated context: {ctx}")
+
+            elif msg_type == "update_config":
+                new_model = data.get("model")
+                if new_model and new_model != transcriber.current_model_size:
+                    logger.info(f"Requests model change to: {new_model}")
+                    await websocket.send(json.dumps({"type": "status", "message": f"Reloading model to {new_model}..."}))
+                    
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(None, transcriber.load_model, new_model)
+                    
+                    if success:
+                        await websocket.send(json.dumps({"type": "status", "message": f"Model changed to {new_model}"}))
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": "Failed to load model"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("Client disconnected")
