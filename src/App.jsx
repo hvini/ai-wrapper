@@ -9,6 +9,8 @@ function App() {
   const [analyses, setAnalyses] = useState([]);
   const [deviceStatus, setDeviceStatus] = useState("Detecting audio...");
   const [context, setContext] = useState("");
+  const [activeTab, setActiveTab] = useState("live");
+  const [expandedSection, setExpandedSection] = useState(null); // 'transcription', 'analysis', or null
 
   const ws = useRef(null);
   const transcriptionRef = useRef(null);
@@ -38,11 +40,7 @@ function App() {
     }
   }, [transcripts]);
 
-  useEffect(() => {
-    if (analysisRef.current) {
-      analysisRef.current.scrollTop = analysisRef.current.scrollHeight;
-    }
-  }, [analyses]);
+
 
 
   const connectWs = () => {
@@ -130,6 +128,20 @@ function App() {
     }
   };
 
+  // Toggle expansion helper
+  const toggleExpand = (section) => {
+    if (expandedSection === section) {
+      setExpandedSection(null); // Reset to split view
+    } else {
+      setExpandedSection(section);
+    }
+  };
+
+  const getSectionClass = (section) => {
+    if (!expandedSection) return ""; // Default split
+    return expandedSection === section ? "expanded" : "collapsed";
+  };
+
   return (
     <div className="glass-container">
       <div className="header">
@@ -139,36 +151,87 @@ function App() {
         </div>
       </div>
 
+      <div className="location-tabs">
+        <button
+          className={`tab-btn ${activeTab === 'live' ? 'active' : ''}`}
+          onClick={() => setActiveTab('live')}
+        >
+          Live Monitor
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'context' ? 'active' : ''}`}
+          onClick={() => setActiveTab('context')}
+        >
+          Context & Setup
+        </button>
+      </div>
+
       <div className="main-content">
-        <textarea
-          className="context-input"
-          placeholder="System Context (e.g. 'Summarize key points regarding Biology')"
-          value={context}
-          onChange={(e) => setContext(e.target.value)}
-          rows="2"
-        />
-
-        <div className="transcription-area">
-          <h2>Live Transcription</h2>
-          <div className="scroll-box" ref={transcriptionRef}>
-            {transcripts.length === 0 ? <p style={{ opacity: 0.5 }}>Waiting for speech...</p> :
-              transcripts.map((t, i) => <p key={i}> {t}</p>)
-            }
+        {activeTab === 'context' ? (
+          <div className="context-container">
+            <div className="input-group">
+              <label>System Context / Instructions</label>
+              <textarea
+                className="context-input full-height"
+                placeholder="Ex: 'You are a helpful assistant assisting with a medical diagnosis. Focus on key symptoms mentioned...'"
+                value={context}
+                onChange={(e) => setContext(e.target.value)}
+              />
+              <p className="hint-text">
+                This context is sent to the local LLM to guide the analysis of the live transcription.
+              </p>
+            </div>
           </div>
-        </div>
-
-        <div className="analysis-area">
-          <h2>AI Insights</h2>
-          <div className="scroll-box" ref={analysisRef}>
-            {analyses.length === 0 ? <p style={{ opacity: 0.5 }}>Waiting for context...</p> :
-              analyses.map((a, i) => (
-                <div key={i} style={{ marginBottom: '15px', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '10px' }}>
-                  {a}
+        ) : (
+          <>
+            <div className={`transcription-area ${getSectionClass('transcription')}`}>
+              <div className="area-header">
+                <div className="header-title">
+                  <h2>Transcription</h2>
+                  <span className="live-indicator"></span>
                 </div>
-              ))
-            }
-          </div>
-        </div>
+                <button
+                  className="icon-btn"
+                  onClick={() => toggleExpand('transcription')}
+                  title={expandedSection === 'transcription' ? "Restore Split View" : "Maximize view"}
+                >
+                  {expandedSection === 'transcription' ? "Exit Fullscreen" : "Fullscreen"}
+                </button>
+              </div>
+              <div className="scroll-box" ref={transcriptionRef}>
+                {transcripts.length === 0 ?
+                  <div className="empty-state">Waiting for speech...</div> :
+                  transcripts.map((t, i) => <p key={i}>{t}</p>)
+                }
+              </div>
+            </div>
+
+            <div className={`analysis-area ${getSectionClass('analysis')}`}>
+              <div className="area-header">
+                <div className="header-title">
+                  <h2>AI Insights</h2>
+                </div>
+                <button
+                  className="icon-btn"
+                  onClick={() => toggleExpand('analysis')}
+                  title={expandedSection === 'analysis' ? "Restore Split View" : "Maximize view"}
+                >
+                  {expandedSection === 'analysis' ? "Exit Fullscreen" : "Fullscreen"}
+                </button>
+              </div>
+              <div className="scroll-box" ref={analysisRef}>
+                {analyses.length === 0 ?
+                  <div className="empty-state">Waiting for context...</div> :
+                  analyses.map((a, i) => (
+                    <div key={i} className="analysis-item">
+                      {a}
+                    </div>
+                  ))
+                }
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="controls-footer">
