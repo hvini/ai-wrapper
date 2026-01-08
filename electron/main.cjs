@@ -11,6 +11,7 @@ function createWindow() {
         height: 600,
         transparent: true,
         frame: false,
+        alwaysOnTop: true,
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false, // For simple prototype; specific security usually requires true + preload

@@ -8,7 +8,7 @@ function App() {
   const [transcripts, setTranscripts] = useState([]);
   const [analyses, setAnalyses] = useState([]);
   const [deviceStatus, setDeviceStatus] = useState("Detecting audio...");
-  const [context, setContext] = useState("");
+  const [context, setContext] = useState("Seja direto e vá direto ao ponto.");
   const [activeTab, setActiveTab] = useState("live");
   const [modelSize, setModelSize] = useState("small");
   const [expandedSection, setExpandedSection] = useState(null); // 'transcription', 'analysis', or null

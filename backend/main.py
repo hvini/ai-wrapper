@@ -28,6 +28,18 @@ AVAILABLE_MODELS = [
         "name": "Llama 3 8B Instruct (Q4_K_M)",
         "repo_id": "bartowski/Meta-Llama-3-8B-Instruct-GGUF",
         "filename": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+    },
+    {
+        "id": "qwen-2.5-coder-7b-instruct",
+        "name": "Qwen 2.5 Coder 7B (Best for Code)",
+        "repo_id": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"
+    },
+    {
+        "id": "phi-3.5-mini-instruct",
+        "name": "Phi 3.5 Mini 3.8B (Fastest)",
+        "repo_id": "bartowski/Phi-3.5-mini-instruct-GGUF",
+        "filename": "Phi-3.5-mini-instruct-Q4_K_M.gguf"
     }
 ]
 
@@ -276,7 +288,7 @@ class LlamaService:
             return None
         
         context_str = f"Contexto: {self.context}\n" if self.context else ""
-        system_prompt = "Você é um assistente útil e conciso. Responda sempre em Português."
+        system_prompt = "Você é um assistente direto e objetivo. Vá direto ao ponto. Responda sempre em Português."
         user_message = f"{context_str}Analise a seguinte transcrição de áudio brevemente: \"{text}\""
         
         try:
@@ -314,29 +326,36 @@ async def ws_handler(websocket):
     if transcriber is None:
         transcriber = TranscriptionService()
 
+    
+    # Event to signal when audio processing is fully caught up (queue empty + buffer processed)
+    processing_done_event = asyncio.Event()
+    processing_done_event.set() # Initially true as we are not recording
+
     async def process_audio_loop():
         buffer = np.array([], dtype=np.float32)
-
+        
+        # VAD Parameters
         SILENCE_THRESHOLD = 0.005 
         REQUIRED_SILENCE_S = 0.4
         MAX_PHRASE_S = 15.0
-        MIN_PHRASE_S = 0.5
-
+        MIN_PHRASE_S = 0.5 
+        
+        # State
         STATE_IDLE = "IDLE"
         STATE_RECORDING = "RECORDING"
         state = STATE_IDLE
-
+        
         consecutive_silent_samples = 0
         
         while True:
-            if not recorder.running:
-                await asyncio.sleep(0.1)
-                buffer = np.array([], dtype=np.float32)
-                state = STATE_IDLE
-                continue
-                
+            # We check queue first regardless of running state to drain it
             chunk = recorder.get_audio_chunk()
+            
             if chunk is not None:
+                # We have data, so we are definitely not "done" processing
+                processing_done_event.clear()
+                
+                # Check for silence in THIS chunk
                 chunk_max = np.max(np.abs(chunk))
                 is_silent = chunk_max < SILENCE_THRESHOLD
                 
@@ -367,6 +386,7 @@ async def ws_handler(websocket):
                             should_transcribe = True
                             reason = "end_of_speech"
                         else:
+                            # Too short, discard
                             logger.info(f"Discarding short noise ({speech_duration:.2f}s)")
                             state = STATE_IDLE
                             buffer = np.array([], dtype=np.float32)
@@ -379,7 +399,6 @@ async def ws_handler(websocket):
                         logger.info(f"Transcribing ({reason})... Duration: {total_duration:.2f}s")
                         
                         current_buffer = buffer.copy()
-
                         buffer = np.array([], dtype=np.float32)
                         state = STATE_IDLE
                         consecutive_silent_samples = 0
@@ -394,10 +413,41 @@ async def ws_handler(websocket):
                                 "text": text
                             }))
                             session_transcript.append(text)
-                        else:
-                            logger.info("Transcription yielded empty text")
+            
             else:
-                await asyncio.sleep(0.01)
+                # Queue is empty
+                if not recorder.running:
+                    # Recorder stopped AND queue is empty
+                    
+                    # If we have leftover buffer that is significant, flush it
+                    if len(buffer) > 0:
+                        total_duration = len(buffer) / SAMPLE_RATE
+                        if total_duration > MIN_PHRASE_S:
+                            logger.info(f"Flushing remaining audio... ({total_duration:.2f}s)")
+                            current_buffer = buffer.copy()
+                            buffer = np.array([], dtype=np.float32)
+                            
+                            loop = asyncio.get_running_loop()
+                            text = await loop.run_in_executor(None, transcriber.transcribe, current_buffer)
+                            if text:
+                                logger.info(f"Transcribed (Flush): {text}")
+                                await websocket.send(json.dumps({"type": "transcription", "text": text}))
+                                session_transcript.append(text)
+                        else:
+                            # Discard tiny remainder
+                            buffer = np.array([], dtype=np.float32)
+                    
+                    state = STATE_IDLE
+                    consecutive_silent_samples = 0
+                    
+                    # Signal we are done
+                    if not processing_done_event.is_set():
+                        processing_done_event.set()
+                        
+                    await asyncio.sleep(0.1)
+                else:
+                    # Running but no data yet
+                    await asyncio.sleep(0.01)
 
     process_task = asyncio.create_task(process_audio_loop())
 
@@ -416,6 +466,7 @@ async def ws_handler(websocket):
                 
             elif msg_type == "start_record":
                 session_transcript.clear()
+                processing_done_event.clear() # Mark as busy
                 device_idx = data.get("device_index")
                 logger.info(f"Request start record with device_index: {device_idx} (Type: {type(device_idx)})")
                 recorder.set_device(device_idx)
@@ -426,6 +477,15 @@ async def ws_handler(websocket):
                     
             elif msg_type == "stop_record":
                 recorder.stop()
+                await websocket.send(json.dumps({"type": "status", "message": "Stopping..."}))
+                
+                # Wait for processing to finish
+                logger.info("Waiting for transcription to flush...")
+                try:
+                    await asyncio.wait_for(processing_done_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Timed out waiting for transcription flush")
+
                 await websocket.send(json.dumps({"type": "status", "message": "Recording stopped"}))
 
                 full_text = " ".join(session_transcript).strip()
@@ -436,7 +496,7 @@ async def ws_handler(websocket):
                     analysis = await loop.run_in_executor(None, llama_service.process, full_text)
                     if analysis:
                         await websocket.send(json.dumps({
-                            "type": "ollama_response", # Keeping type name for compatibility for now
+                            "type": "ollama_response",
                             "text": analysis
                         }))
             
