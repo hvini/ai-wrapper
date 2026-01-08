@@ -159,6 +159,41 @@ body {
   flex-direction: column;
   height: 100%;
   animation: fadeIn 0.4s ease-out;
+  overflow-y: auto;
+  padding-right: 8px;
+  /* Avoid scrollbar overlap content */
+}
+
+/* Resize Handle */
+.resize-handle {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  cursor: se-resize;
+  z-index: 50;
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.4) 1px, transparent 1px);
+  background-size: 4px 4px;
+  background-position: center;
+  mask-image: linear-gradient(135deg, transparent 50%, black 50%);
+  -webkit-mask-image: linear-gradient(135deg, transparent 50%, black 50%);
+  opacity: 0.7;
+  transition: opacity 0.2s;
+  pointer-events: none;
+  /* Let clicks pass through if handled by OS, or auto if handled by electron-drag/resize logic which usually needs interactable area. But usually purely visual if window manager handles it. 
+  Actually for a custom frameless window, often you need a div with -webkit-app-region: no-drag (it is default) and maybe some electron logic, or just let it start resizing.
+  If this is just an INDICATOR, pointer-events: none is safer to not block underlying clicks if any. But usually resize handle IS the thing you click.
+  However, often resizing is done by the window border. If the user wants to drag FROM IT, it implies it should be a drag handle.
+  In many Electron frameless setups, you just rely on the edges.
+  Unless I am using a library for custom resize handles.
+  I will assume it is visual mainly, but giving it pointer-events: auto won't hurt.
+  */
+  pointer-events: auto;
+}
+
+.resize-handle:hover {
+  opacity: 1;
 }
 
 .input-group {
@@ -520,6 +555,95 @@ button.glass-btn.recording {
   background-color: rgba(255, 255, 255, 0.25);
 }
 
-::-webkit-scrollbar-corner {
-  background: transparent;
+
+/* Model Manager */
+.model-manager {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(0, 0, 0, 0.15);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 10px;
+}
+
+.model-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.model-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-name {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #fff;
+}
+
+.tag {
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.active-tag {
+  background: rgba(74, 222, 128, 0.2);
+  color: #4ade80;
+  border: 1px solid rgba(74, 222, 128, 0.3);
+}
+
+.downloaded-tag {
+  background: rgba(129, 140, 248, 0.2);
+  color: #818cf8;
+  border: 1px solid rgba(129, 140, 248, 0.3);
+}
+
+.model-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.small-glass-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 6px 14px;
+  border-radius: 16px;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.small-glass-btn:hover:not(.disabled) {
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.small-glass-btn.download-btn {
+  background: rgba(129, 140, 248, 0.15);
+  color: #a5b4fc;
+  border-color: rgba(129, 140, 248, 0.2);
+}
+
+.small-glass-btn.download-btn:hover {
+  background: rgba(129, 140, 248, 0.25);
+  color: #fff;
+}
+
+.small-glass-btn.disabled {
+  opacity: 0.5;
+  cursor: default;
 }

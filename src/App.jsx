@@ -12,6 +12,7 @@ function App() {
   const [activeTab, setActiveTab] = useState("live");
   const [modelSize, setModelSize] = useState("small");
   const [expandedSection, setExpandedSection] = useState(null); // 'transcription', 'analysis', or null
+  const [llmModels, setLlmModels] = useState({ local: [], available: [], current: null });
 
   const ws = useRef(null);
   const transcriptionRef = useRef(null);
@@ -43,6 +44,12 @@ function App() {
     return () => clearTimeout(handler);
   }, [context, status]);
 
+  useEffect(() => {
+    if (activeTab === 'context' && ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({ type: "get_llm_models" }));
+    }
+  }, [activeTab, status]);
+
   // Auto-scroll
   useEffect(() => {
     if (transcriptionRef.current) {
@@ -60,6 +67,7 @@ function App() {
     ws.current.onopen = () => {
       setStatus("Connected");
       ws.current.send(JSON.stringify({ type: "get_devices" }));
+      ws.current.send(JSON.stringify({ type: "get_llm_models" }));
       if (context) {
         ws.current.send(JSON.stringify({ type: "update_context", context: context }));
       }
@@ -106,6 +114,14 @@ function App() {
           break;
         case "status":
           console.log("Status:", data.message);
+          // Optional: Display status toast or something
+          break;
+        case "llm_models":
+          setLlmModels({
+            local: data.local || [],
+            available: data.available || [],
+            current: data.current
+          });
           break;
         case "error":
           alert("Error: " + data.message);
@@ -135,6 +151,19 @@ function App() {
       setTranscripts([]);
       setAnalyses([]);
       setIsRecording(true);
+    }
+  };
+
+  const loadLlm = (filename) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    ws.current.send(JSON.stringify({ type: "load_llm_model", filename }));
+  };
+
+  const downloadModel = (modelId) => {
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
+    const confirmDownload = confirm("Downloading a large model (4GB+). This will happen in the background. Continue?");
+    if (confirmDownload) {
+      ws.current.send(JSON.stringify({ type: "download_model", model_id: modelId }));
     }
   };
 
@@ -193,6 +222,55 @@ function App() {
                 <option value="medium">Medium (Better, Slower)</option>
                 <option value="large-v3">Large v3 (Best, Slowest)</option>
               </select>
+            </div>
+
+            <div className="input-group" style={{ flex: '0 0 auto', marginBottom: '20px' }}>
+              <label>LLM Model (GGUF)</label>
+              <div className="model-manager">
+                {llmModels.available.map((model) => {
+                  const isDownloaded = llmModels.local.includes(model.filename);
+                  const isActive = llmModels.current === model.filename;
+
+                  return (
+                    <div key={model.id} className="model-item">
+                      <div className="model-info">
+                        <span className="model-name">{model.name}</span>
+                        {isActive && <span className="tag active-tag">Active</span>}
+                        {isDownloaded && !isActive && <span className="tag downloaded-tag">Downloaded</span>}
+                      </div>
+                      <div className="model-actions">
+                        {isDownloaded ? (
+                          isActive ? (
+                            <button className="small-glass-btn disabled" disabled>Active</button>
+                          ) : (
+                            <button className="small-glass-btn" onClick={() => loadLlm(model.filename)}>Load</button>
+                          )
+                        ) : (
+                          <button className="small-glass-btn download-btn" onClick={() => downloadModel(model.id)}>Download</button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+
+                {/* Show other local models not in available list (custom models) */
+                  llmModels.local
+                    .filter(f => !llmModels.available.some(am => am.filename === f))
+                    .map(f => (
+                      <div key={f} className="model-item">
+                        <div className="model-info">
+                          <span className="model-name">{f} (Custom)</span>
+                          {llmModels.current === f && <span className="tag active-tag">Active</span>}
+                        </div>
+                        <div className="model-actions">
+                          {llmModels.current !== f && (
+                            <button className="small-glass-btn" onClick={() => loadLlm(f)}>Load</button>
+                          )}
+                        </div>
+                      </div>
+                    ))
+                }
+              </div>
             </div>
 
             <div className="input-group">
@@ -269,6 +347,7 @@ function App() {
           {isRecording ? "Stop Listening" : "Start Listening"}
         </button>
       </div>
+      <div className="resize-handle" />
     </div>
   )
 }

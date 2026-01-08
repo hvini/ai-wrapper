@@ -9,16 +9,30 @@ import websockets
 from faster_whisper import WhisperModel
 import requests
 import sys
+import os
+from llama_cpp import Llama
+from huggingface_hub import hf_hub_download
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Backend")
 
 # Configuration
-OLLAMA_URL = "http://localhost:11434/api/generate"
-WHISPER_MODEL_SIZE = "large"
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+WHISPER_MODEL_SIZE = "small"
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 4096
+
+AVAILABLE_MODELS = [
+    {
+        "id": "llama-3-8b-instruct",
+        "name": "Llama 3 8B Instruct (Q4_K_M)",
+        "repo_id": "bartowski/Meta-Llama-3-8B-Instruct-GGUF",
+        "filename": "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf"
+    }
+]
 
 # Try to import soundcard, fallback to sounddevice (though sounddevice failed)
 USE_SOUNDCARD = False
@@ -169,43 +183,74 @@ class TranscriptionService:
             logger.error(f"Transcription error: {e}")
             return ""
 
-class OllamaService:
+class LlamaService:
     def __init__(self):
         self.context = ""
+        self.llm = None
+        self.current_model_path = None
+        # Try to auto-load first available model
+        self.auto_load_model()
+
+    def auto_load_model(self):
+        # Find first gguf in models dir
+        try:
+            files = [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")]
+            if files:
+                self.load_model(files[0])
+        except Exception as e:
+            logger.error(f"Auto-load failed: {e}")
+
+    def load_model(self, filename):
+        path = os.path.join(MODELS_DIR, filename)
+        if not os.path.exists(path):
+            logger.error(f"Model file not found: {path}")
+            return False
+            
+        try:
+            logger.info(f"Loading Llama model: {path}")
+            # n_gpu_layers=-1 attempts to offload all layers to GPU
+            self.llm = Llama(model_path=path, n_gpu_layers=-1, n_ctx=2048, verbose=True)
+            self.current_model_path = filename
+            logger.info(f"Llama model loaded successfully!")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load Llama model: {e}")
+            return False
 
     def set_context(self, context):
         self.context = context
 
     def process(self, text):
+        if not self.llm:
+            return "Erro: Nenhum modelo de IA carregado. Por favor baixe/selecione um modelo."
+            
         if not text or len(text) < 5: 
             return None
         
         # Enhanced prompt with context
         context_str = f"Contexto: {self.context}\n" if self.context else ""
-        prompt = f"{context_str}Analise a seguinte transcrição de áudio brevemente (responda em Português): \"{text}\""
+        system_prompt = "Você é um assistente útil e conciso. Responda sempre em Português."
+        user_message = f"{context_str}Analise a seguinte transcrição de áudio brevemente: \"{text}\""
         
         try:
-            response = requests.post(OLLAMA_URL, json={
-                "model": "llama3", 
-                "prompt": prompt,
-                "stream": False
-            }, timeout=60)
+            output = self.llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                max_tokens=512,
+                temperature=0.7
+            )
             
-            if response.status_code == 200:
-                res_json = response.json()
-                return res_json.get('response', '')
-            elif response.status_code == 404:
-                return "Ollama error: Model 'llama3' not found. Please `ollama pull llama3` or change code."
-            else:
-                return f"Ollama error: {response.text}"
+            return output['choices'][0]['message']['content']
         except Exception as e:
-            logger.error(f"Ollama connection failed: {e}")
-            return None
+            logger.error(f"Llama inference failed: {e}")
+            return f"Erro na inferência: {str(e)}"
 
 # Global instances
 recorder = AudioRecorder()
 transcriber = None
-ollama = OllamaService()
+llama_service = LlamaService()
 
 async def ws_handler(websocket):
     logger.info("Client connected")
@@ -291,16 +336,16 @@ async def ws_handler(websocket):
                     logger.info("Analyzing full transcript...")
                     await websocket.send(json.dumps({"type": "status", "message": "Generating AI Insights..."}))
                     loop = asyncio.get_running_loop()
-                    analysis = await loop.run_in_executor(None, ollama.process, full_text)
+                    analysis = await loop.run_in_executor(None, llama_service.process, full_text)
                     if analysis:
                         await websocket.send(json.dumps({
-                            "type": "ollama_response",
+                            "type": "ollama_response", # Keeping type name for compatibility for now
                             "text": analysis
                         }))
             
             elif msg_type == "update_context":
                 ctx = data.get("context", "")
-                ollama.set_context(ctx)
+                llama_service.set_context(ctx)
                 logger.info(f"Updated context: {ctx}")
 
             elif msg_type == "update_config":
@@ -316,6 +361,71 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"type": "status", "message": f"Model changed to {new_model}"}))
                     else:
                         await websocket.send(json.dumps({"type": "error", "message": "Failed to load model"}))
+            
+            elif msg_type == "get_llm_models":
+                # List local models and available to download models
+                local_models = []
+                if os.path.exists(MODELS_DIR):
+                    local_models = [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")]
+                
+                await websocket.send(json.dumps({
+                    "type": "llm_models",
+                    "local": local_models,
+                    "available": AVAILABLE_MODELS,
+                    "current": llama_service.current_model_path
+                }))
+
+            elif msg_type == "load_llm_model":
+                filename = data.get("filename")
+                logger.info(f"Request to load LLM model: {filename}")
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(None, llama_service.load_model, filename)
+                if success:
+                     await websocket.send(json.dumps({"type": "status", "message": f"Loaded LLM: {filename}"}))
+                     # Refresh list to update 'current'
+                     await websocket.send(json.dumps({
+                        "type": "llm_models",
+                        "local": [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")],
+                        "available": AVAILABLE_MODELS,
+                        "current": llama_service.current_model_path
+                    }))
+                else:
+                     await websocket.send(json.dumps({"type": "error", "message": f"Failed to load LLM: {filename}"}))
+
+            elif msg_type == "download_model":
+                model_id = data.get("model_id")
+                # Find model info
+                model_info = next((m for m in AVAILABLE_MODELS if m["id"] == model_id), None)
+                if model_info:
+                    await websocket.send(json.dumps({"type": "status", "message": f"Downloading {model_info['name']}... This may take a while."}))
+                    
+                    def download_task():
+                        try:
+                            hf_hub_download(
+                                repo_id=model_info["repo_id"],
+                                filename=model_info["filename"],
+                                local_dir=MODELS_DIR,
+                                local_dir_use_symlinks=False
+                            )
+                            return True
+                        except Exception as e:
+                            logger.error(f"Download failed: {e}")
+                            return False
+
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(None, download_task)
+                    
+                    if success:
+                        await websocket.send(json.dumps({"type": "status", "message": f"Downloaded {model_info['name']}"}))
+                        # Refresh list
+                        await websocket.send(json.dumps({
+                            "type": "llm_models",
+                            "local": [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")],
+                            "available": AVAILABLE_MODELS,
+                            "current": llama_service.current_model_path
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"type": "error", "message": f"Failed to download {model_info['name']}"}))
 
     except websockets.exceptions.ConnectionClosed:
         logger.info("Client disconnected")
@@ -332,6 +442,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # On linux, we often use 'spawn' or 'fork', but default fork is fine for basics
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
