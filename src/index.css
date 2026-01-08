@@ -395,6 +395,16 @@ select.context-input option {
   animation: fadeIn 0.4s ease-out;
 }
 
+.transcription-stream {
+  line-height: 1.7;
+  color: #fff;
+  font-size: 1.05rem;
+}
+
+.transcription-stream span {
+  animation: fadeIn 0.3s ease-out;
+}
+
 /* Footer */
 .controls-footer {
   padding: 20px;

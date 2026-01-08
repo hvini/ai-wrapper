@@ -10,14 +10,11 @@ from faster_whisper import WhisperModel
 import requests
 import sys
 import os
-from llama_cpp import Llama
 from huggingface_hub import hf_hub_download
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Backend")
 
-# Configuration
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -34,7 +31,6 @@ AVAILABLE_MODELS = [
     }
 ]
 
-# Try to import soundcard, fallback to sounddevice (though sounddevice failed)
 USE_SOUNDCARD = False
 try:
     import soundcard as sc
@@ -49,7 +45,6 @@ except ImportError:
         sys.exit(1)
     except OSError:
         logger.error("SoundDevice failed (PortAudio missing?). Install 'soundcard' or install 'libportaudio2'.")
-        # Ensure we don't crash loop
         pass
 
 class AudioRecorder:
@@ -62,11 +57,9 @@ class AudioRecorder:
     def list_devices(self):
         devices = []
         if USE_SOUNDCARD:
-             # soundcard
             try:
                 mics = sc.all_microphones(include_loopback=True)
                 for i, mic in enumerate(mics):
-                    # Check loopback by name convention because attribute might be missing
                     is_loopback = "monitor" in mic.name.lower() or "loopback" in mic.name.lower()
                     devices.append({
                         "index": mic.id, 
@@ -91,15 +84,11 @@ class AudioRecorder:
             return
 
         try:
-            # Find the mic object
             mic = sc.get_microphone(self.device_id, include_loopback=True)
             
             with mic.recorder(samplerate=SAMPLE_RATE, channels=1) as recorder:
                 while self.running:
-                    # Record a block
                     data = recorder.record(numframes=BLOCK_SIZE)
-                    # data is (frames, channels) float32
-                    # flatten to 1D
                     data = data.flatten()
                     self.audio_queue.put(data)
                     
@@ -112,8 +101,7 @@ class AudioRecorder:
             return True
             
         self.running = True
-        
-        # Clear queue
+
         with self.audio_queue.mutex:
             self.audio_queue.queue.clear()
             
@@ -162,20 +150,17 @@ class TranscriptionService:
 
     def transcribe(self, audio_data):
         try:
-            # VAD filter provided by faster-whisper
-            # We can also check if signal is silence manually to save compute
             if np.max(np.abs(audio_data)) < 0.002:
                 return ""
 
             segments, info = self.model.transcribe(
-                audio_data, 
-                beam_size=1,            # Faster (Greedy)
-                best_of=1,              # Faster
-                vad_filter=True, 
-                vad_parameters=dict(min_silence_duration_ms=500), # More aggressive VAD
+                audio_data,
+                beam_size=1,
+                best_of=1,
+                vad_filter=False,
                 language="pt",
                 temperature=0.0,
-                condition_on_previous_text=False # vital for short independent chunks
+                condition_on_previous_text=False
             )
             text = " ".join([segment.text for segment in segments]).strip()
             return text
@@ -183,16 +168,31 @@ class TranscriptionService:
             logger.error(f"Transcription error: {e}")
             return ""
 
+import subprocess
+import atexit
+
+LLAMA_SERVER_BIN = os.path.join(os.path.dirname(__file__), "llama.cpp/build/bin/llama-server")
+
 class LlamaService:
     def __init__(self):
         self.context = ""
-        self.llm = None
+        self.server_process = None
         self.current_model_path = None
-        # Try to auto-load first available model
+        self.port = 8081
+        atexit.register(self.stop_server)
         self.auto_load_model()
 
+    def stop_server(self):
+        if self.server_process:
+            logger.info("Stopping Llama Server...")
+            self.server_process.terminate()
+            try:
+                self.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
+            self.server_process = None
+
     def auto_load_model(self):
-        # Find first gguf in models dir
         try:
             files = [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")]
             if files:
@@ -206,48 +206,103 @@ class LlamaService:
             logger.error(f"Model file not found: {path}")
             return False
             
-        try:
-            logger.info(f"Loading Llama model: {path}")
-            # n_gpu_layers=-1 attempts to offload all layers to GPU
-            self.llm = Llama(model_path=path, n_gpu_layers=-1, n_ctx=2048, verbose=True)
-            self.current_model_path = filename
-            logger.info(f"Llama model loaded successfully!")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load Llama model: {e}")
+        if not os.path.exists(LLAMA_SERVER_BIN):
+            logger.error(f"Llama Server binary not found at: {LLAMA_SERVER_BIN}")
             return False
+
+        self.stop_server()
+
+        try:
+            logger.info(f"Starting Llama Server with model: {filename}")
+            # Start process
+            # -m model
+            # -c context size
+            # --port port
+            # --n-gpu-layers -1 (offload all)
+            cmd = [
+                LLAMA_SERVER_BIN,
+                "-m", path,
+                "-c", "2048",
+                "--port", str(self.port),
+                "-ngl", "999" # Try to offload all layers
+            ]
+            
+            # Use separate process group or detach if needed, but simple Popen is usually fine for parent-child
+            self.server_process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.DEVNULL, # Redirect logs to avoid clutter or handle them?
+                stderr=subprocess.PIPE     # Maybe capture stderr for errors
+            )
+            
+            # Wait for server to be ready
+            self.current_model_path = filename
+            return self._wait_for_ready()
+
+        except Exception as e:
+            logger.error(f"Failed to start Llama Server: {e}")
+            return False
+
+    def _wait_for_ready(self):
+        logger.info("Waiting for Llama Server to be ready...")
+        url = f"http://127.0.0.1:{self.port}/health" # or just check any endpoint
+        # llama-server often has /health
+        
+        for _ in range(20): # Wait up to 20s
+            try:
+                # Try simple GET
+                requests.get(f"http://127.0.0.1:{self.port}/index.html", timeout=1)
+                logger.info("Llama Server is ready!")
+                return True
+            except:
+                time.sleep(1)
+                if self.server_process and self.server_process.poll() is not None:
+                    # Process died
+                    _, err = self.server_process.communicate()
+                    logger.error(f"Llama Server exited unexpectedly. Stderr: {err}")
+                    return False
+        
+        logger.error("Timed out waiting for Llama Server")
+        self.stop_server()
+        return False
 
     def set_context(self, context):
         self.context = context
 
     def process(self, text):
-        if not self.llm:
-            return "Erro: Nenhum modelo de IA carregado. Por favor baixe/selecione um modelo."
+        if not self.server_process:
+            return "Erro: Nenhum modelo de IA carregado (Server not running)."
             
         if not text or len(text) < 5: 
             return None
         
-        # Enhanced prompt with context
         context_str = f"Contexto: {self.context}\n" if self.context else ""
         system_prompt = "Você é um assistente útil e conciso. Responda sempre em Português."
         user_message = f"{context_str}Analise a seguinte transcrição de áudio brevemente: \"{text}\""
         
         try:
-            output = self.llm.create_chat_completion(
-                messages=[
+            # Use OpenAI compatible endpoint
+            url = f"http://127.0.0.1:{self.port}/v1/chat/completions"
+            payload = {
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message}
                 ],
-                max_tokens=512,
-                temperature=0.7
-            )
+                "max_tokens": 512,
+                "temperature": 0.7
+            }
             
-            return output['choices'][0]['message']['content']
+            response = requests.post(url, json=payload, timeout=60)
+            
+            if response.status_code == 200:
+                res_json = response.json()
+                return res_json['choices'][0]['message']['content']
+            else:
+                return f"Error from Llama Server: {response.text}"
+
         except Exception as e:
             logger.error(f"Llama inference failed: {e}")
             return f"Erro na inferência: {str(e)}"
 
-# Global instances
 recorder = AudioRecorder()
 transcriber = None
 llama_service = LlamaService()
@@ -261,44 +316,86 @@ async def ws_handler(websocket):
 
     async def process_audio_loop():
         buffer = np.array([], dtype=np.float32)
-        PROCESS_INTERVAL = 3.0 
+
+        SILENCE_THRESHOLD = 0.005 
+        REQUIRED_SILENCE_S = 0.4
+        MAX_PHRASE_S = 15.0
+        MIN_PHRASE_S = 0.5
+
+        STATE_IDLE = "IDLE"
+        STATE_RECORDING = "RECORDING"
+        state = STATE_IDLE
+
+        consecutive_silent_samples = 0
         
         while True:
             if not recorder.running:
                 await asyncio.sleep(0.1)
                 buffer = np.array([], dtype=np.float32)
+                state = STATE_IDLE
                 continue
                 
             chunk = recorder.get_audio_chunk()
             if chunk is not None:
-                if len(buffer) == 0:
-                     logger.info("Receiving audio data...")
-                buffer = np.concatenate((buffer, chunk))
+                chunk_max = np.max(np.abs(chunk))
+                is_silent = chunk_max < SILENCE_THRESHOLD
                 
-                if len(buffer) >= SAMPLE_RATE * PROCESS_INTERVAL:
-                    logger.info(f"Buffer full ({len(buffer)} samples), transcribing...")
-                    current_buffer = buffer.copy()
+                if state == STATE_IDLE:
+                    if not is_silent:
+                        state = STATE_RECORDING
+                        buffer = chunk.copy()
+                        consecutive_silent_samples = 0
+                        logger.info("Speech detected, starting capture...")
+                
+                elif state == STATE_RECORDING:
+                    buffer = np.concatenate((buffer, chunk))
                     
-                    # Implement simple overlap to catch words at boundary
-                    # Keep last 0.5s of audio for context in next chunk
-                    overlap_samples = int(SAMPLE_RATE * 0.5)
-                    if len(buffer) > overlap_samples:
-                         buffer = buffer[-overlap_samples:]
+                    if is_silent:
+                        consecutive_silent_samples += len(chunk)
                     else:
-                         buffer = np.array([], dtype=np.float32)
+                        consecutive_silent_samples = 0
                     
-                    loop = asyncio.get_running_loop()
-                    text = await loop.run_in_executor(None, transcriber.transcribe, current_buffer)
+                    total_duration = len(buffer) / SAMPLE_RATE
+                    silence_duration = consecutive_silent_samples / SAMPLE_RATE
                     
-                    if text:
-                        logger.info(f"Transcribed: {text}")
-                        await websocket.send(json.dumps({
-                            "type": "transcription",
-                            "text": text
-                        }))
-                        session_transcript.append(text)
-                    else:
-                        logger.info("Transcription yielded empty text (silence?)")
+                    should_transcribe = False
+                    reason = ""
+                    
+                    if silence_duration >= REQUIRED_SILENCE_S:
+                        speech_duration = total_duration - silence_duration
+                        if speech_duration > MIN_PHRASE_S:
+                            should_transcribe = True
+                            reason = "end_of_speech"
+                        else:
+                            logger.info(f"Discarding short noise ({speech_duration:.2f}s)")
+                            state = STATE_IDLE
+                            buffer = np.array([], dtype=np.float32)
+                            
+                    elif total_duration >= MAX_PHRASE_S:
+                        should_transcribe = True
+                        reason = "max_duration"
+                    
+                    if should_transcribe:
+                        logger.info(f"Transcribing ({reason})... Duration: {total_duration:.2f}s")
+                        
+                        current_buffer = buffer.copy()
+
+                        buffer = np.array([], dtype=np.float32)
+                        state = STATE_IDLE
+                        consecutive_silent_samples = 0
+                        
+                        loop = asyncio.get_running_loop()
+                        text = await loop.run_in_executor(None, transcriber.transcribe, current_buffer)
+                        
+                        if text:
+                            logger.info(f"Transcribed: {text}")
+                            await websocket.send(json.dumps({
+                                "type": "transcription",
+                                "text": text
+                            }))
+                            session_transcript.append(text)
+                        else:
+                            logger.info("Transcription yielded empty text")
             else:
                 await asyncio.sleep(0.01)
 
@@ -363,7 +460,6 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"type": "error", "message": "Failed to load model"}))
             
             elif msg_type == "get_llm_models":
-                # List local models and available to download models
                 local_models = []
                 if os.path.exists(MODELS_DIR):
                     local_models = [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")]
@@ -382,7 +478,6 @@ async def ws_handler(websocket):
                 success = await loop.run_in_executor(None, llama_service.load_model, filename)
                 if success:
                      await websocket.send(json.dumps({"type": "status", "message": f"Loaded LLM: {filename}"}))
-                     # Refresh list to update 'current'
                      await websocket.send(json.dumps({
                         "type": "llm_models",
                         "local": [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")],
@@ -394,7 +489,6 @@ async def ws_handler(websocket):
 
             elif msg_type == "download_model":
                 model_id = data.get("model_id")
-                # Find model info
                 model_info = next((m for m in AVAILABLE_MODELS if m["id"] == model_id), None)
                 if model_info:
                     await websocket.send(json.dumps({"type": "status", "message": f"Downloading {model_info['name']}... This may take a while."}))
@@ -417,7 +511,6 @@ async def ws_handler(websocket):
                     
                     if success:
                         await websocket.send(json.dumps({"type": "status", "message": f"Downloaded {model_info['name']}"}))
-                        # Refresh list
                         await websocket.send(json.dumps({
                             "type": "llm_models",
                             "local": [f for f in os.listdir(MODELS_DIR) if f.endswith(".gguf")],
@@ -442,7 +535,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # On linux, we often use 'spawn' or 'fork', but default fork is fine for basics
         asyncio.run(main())
     except KeyboardInterrupt:
         pass

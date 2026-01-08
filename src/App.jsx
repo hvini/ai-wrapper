@@ -305,7 +305,9 @@ function App() {
               <div className="scroll-box" ref={transcriptionRef}>
                 {transcripts.length === 0 ?
                   <div className="empty-state">Waiting for speech...</div> :
-                  transcripts.map((t, i) => <p key={i}>{t}</p>)
+                  <div className="transcription-stream">
+                    {transcripts.map((t, i) => <span key={i}>{t} </span>)}
+                  </div>
                 }
               </div>
             </div>

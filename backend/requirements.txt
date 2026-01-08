@@ -4,4 +4,3 @@ requests
 websockets
 sounddevice
 huggingface-hub
-llama-cpp-python
